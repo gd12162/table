@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Paste Table (Excel-like)</title>
+
+  <!-- Tabulator CSS -->
+  <link
+    href="https://unpkg.com/tabulator-tables@5.5.0/dist/css/tabulator.min.css"
+    rel="stylesheet"
+  />
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+      margin: 20px;
+      background: #f5f5f5;
+    }
+
+    h2 {
+      margin-bottom: 8px;
+    }
+
+    #info {
+      font-size: 13px;
+      color: #555;
+      line-height: 1.5;
+      margin-bottom: 12px;
+    }
+
+    #toolbar {
+      margin-bottom: 10px;
+    }
+
+    button {
+      margin-right: 8px;
+      margin-top: 4px;
+      padding: 7px 12px;
+      font-size: 13px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #eee;
+    }
+
+    #table-wrapper {
+      border: 2px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+      padding: 4px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+
+    #table-wrapper.paste-active {
+      border-color: #007bff;
+      box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.1);
+    }
+
+    #table {
+      margin-top: 4px;
+    }
+
+    .hidden-input {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <h2>Excel Paste Table (최대 30열 × 4000행)</h2>
+
+  <div id="info">
+    • 아래 테이블 영역을 한 번 클릭한 후, 엑셀에서 복사한 범위를
+    <b>Ctrl+V</b> 로 붙여넣으면 행이 아래로 계속 추가됩니다.<br />
+    • 열 수가 기존보다 많으면 최대 <b>30열</b>까지 자동 확장됩니다.<br />
+    • 테이블에서 드래그 후 <b>Ctrl+C</b> 하면 다시 엑셀로 복붙할 수
+    있습니다.<br />
+    • 긴 텍스트도 그대로 들어갑니다. 저장은 CSV/JSON 파일로 내려받으세요.
+  </div>
+
+  <div id="toolbar">
+    <button id="clearBtn">전체 삭제</button>
+    <button id="downloadCsvBtn">CSV 다운로드</button>
+    <button id="uploadCsvBtn">CSV 업로드</button>
+    <button id="downloadJsonBtn">JSON 다운로드</button>
+    <button id="uploadJsonBtn">JSON 업로드</button>
+
+    <input
+      type="file"
+      id="csvFileInput"
+      class="hidden-input"
+      accept=".csv,text/csv"
+    />
+    <input
+      type="file"
+      id="jsonFileInput"
+      class="hidden-input"
+      accept=".json,application/json"
+    />
+  </div>
+
+  <div id="table-wrapper">
+    <div id="table"></div>
+  </div>
+
+  <!-- Tabulator JS -->
+  <script src="https://unpkg.com/tabulator-tables@5.5.0/dist/js/tabulator.min.js"></script>
+
+  <script>
+    // ===============================
+    // 설정값
+    // ===============================
+    const INITIAL_COLUMNS = 22; // 기본 열 수
+    const MAX_COLUMNS = 30; // 최대 열 수 (A ~ AD)
+
+    // ===============================
+    // 엑셀 스타일 컬럼 이름 생성 (A, B, ..., Z, AA, AB, ...)
+    // index: 0 기반
+    // ===============================
+    function getExcelColumnLabel(index) {
+      let result = "";
+      let n = index;
+      while (n >= 0) {
+        const rem = n % 26;
+        result = String.fromCharCode(65 + rem) + result;
+        n = Math.floor(n / 26) - 1;
+      }
+      return result;
+    }
+
+    // ===============================
+    // 컬럼 정의 생성
+    // ===============================
+    function createColumns(count) {
+      const cols = [];
+      for (let i = 0; i < count; i++) {
+        cols.push({
+          title: getExcelColumnLabel(i), // A, B, ..., AD
+          field: "col" + i,
+          editor: "textarea", // 긴 텍스트 입력 가능
+          width: 150,
+          headerHozAlign: "center",
+          vertAlign: "middle",
+        });
+      }
+      return cols;
+    }
+
+    // 현재 컬럼 개수 추적
+    let currentColumnCount = INITIAL_COLUMNS;
+
+    // ===============================
+    // 테이블 생성
+    // ===============================
+    const table = new Tabulator("#table", {
+      height: "600px",
+      layout: "fitDataFill",
+      columns: createColumns(INITIAL_COLUMNS),
+      data: [],
+      clipboard: true, // Ctrl+C / Ctrl+V 지원 (복사)
+      clipboardCopyRowRange: "selected",
+      clipboardCopyStyled: false,
+      placeholder: "엑셀에서 범위를 복사한 후, 여기를 클릭하고 Ctrl+V 하세요.",
+    });
+
+    // ===============================
+    // 열 확장: 필요시 컬럼 늘리기 (최대 MAX_COLUMNS)
+    // ===============================
+    function ensureColumns(targetCount) {
+      if (targetCount > MAX_COLUMNS) {
+        targetCount = MAX_COLUMNS;
+      }
+      if (targetCount <= currentColumnCount) return;
+
+      const newCols = createColumns(targetCount);
+      currentColumnCount = targetCount;
+      table.setColumns(newCols);
+    }
+
+    // ===============================
+    // PASTE 활성 영역 관리
+    // (테이블 래퍼 클릭하면 pasteActive = true)
+    // ===============================
+    const tableWrapper = document.getElementById("table-wrapper");
+    let pasteActive = false;
+
+    tableWrapper.addEventListener("click", () => {
+      pasteActive = true;
+      tableWrapper.classList.add("paste-active");
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!tableWrapper.contains(e.target)) {
+        pasteActive = false;
+        tableWrapper.classList.remove("paste-active");
+      }
+    });
+
+    // ===============================
+    // PASTE 처리 (엑셀에서 복사 → 텍스트 형식으로 들어옴)
+    // ===============================
+    document.addEventListener("paste", (e) => {
+      if (!pasteActive) return;
+
+      e.preventDefault();
+
+      const clipboardData = e.clipboardData || window.clipboardData;
+      if (!clipboardData) return;
+
+      let text = clipboardData.getData("text");
+      if (!text) return;
+
+      // 줄바꿈 정리
+      text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+      const lines = text.split("\n").filter((line) => line.length > 0);
+      if (!lines.length) return;
+
+      // 2차원 배열로 파싱
+      const parsedRows = [];
+      let maxColsInPaste = 0;
+
+      for (const line of lines) {
+        const cells = line.split("\t");
+        if (cells.length > maxColsInPaste) {
+          maxColsInPaste = cells.length;
+        }
+        parsedRows.push(cells);
+      }
+
+      // 필요한 열 개수 확보 (최대 MAX_COLUMNS)
+      let targetCols = Math.min(maxColsInPaste, MAX_COLUMNS);
+      ensureColumns(targetCols);
+
+      // Tabulator에 넣을 형태로 변환
+      const dataToAdd = parsedRows.map((cells) => {
+        const rowObj = {};
+        for (let i = 0; i < targetCols; i++) {
+          rowObj["col" + i] = cells[i] !== undefined ? cells[i] : "";
+        }
+        return rowObj;
+      });
+
+      // 기존 데이터 아래로 추가
+      table.addData(dataToAdd);
+    });
+
+    // ===============================
+    // 전체 삭제
+    // ===============================
+    document.getElementById("clearBtn").addEventListener("click", () => {
+      if (!confirm("전체 데이터를 삭제할까요? 이 작업은 되돌릴 수 없습니다.")) {
+        return;
+      }
+      table.clearData();
+      // 열 개수는 유지 (현재 컬럼 구조 그대로)
+    });
+
+    // ===============================
+    // CSV 다운로드
+    // ===============================
+    document
+      .getElementById("downloadCsvBtn")
+      .addEventListener("click", () => {
+        table.download("csv", "table_data.csv");
+      });
+
+    // ===============================
+    // JSON 다운로드
+    // ===============================
+    document
+      .getElementById("downloadJsonBtn")
+      .addEventListener("click", () => {
+        table.download("json", "table_data.json");
+      });
+
+    // ===============================
+    // CSV 파서 (간단 버전 – 큰따옴표 포함 필드 지원)
+    // 긴 텍스트에 콤마가 있는 경우를 대비해 기본적인 CSV 파싱 로직 사용
+    // ===============================
+    function parseCSV(text) {
+      const rows = [];
+      let row = [];
+      let value = "";
+      let insideQuotes = false;
+
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        const nextChar = text[i + 1];
+
+        if (insideQuotes) {
+          if (char === '"' && nextChar === '"') {
+            // 이스케이프된 큰따옴표 ("")
+            value += '"';
+            i++;
+          } else if (char === '"') {
+            insideQuotes = false;
+          } else {
+            value += char;
+          }
+        } else {
+          if (char === '"') {
+            insideQuotes = true;
+          } else if (char === ",") {
+            row.push(value);
+            value = "";
+          } else if (char === "\n") {
+            row.push(value);
+            rows.push(row);
+            row = [];
+            value = "";
+          } else if (char === "\r") {
+            // 무시 (CRLF 대비)
+          } else {
+            value += char;
+          }
+        }
+      }
+
+      // 마지막 값 처리
+      if (value.length > 0 || row.length > 0) {
+        row.push(value);
+        rows.push(row);
+      }
+
+      return rows;
+    }
+
+    // ===============================
+    // CSV 업로드
+    // ===============================
+    const csvFileInput = document.getElementById("csvFileInput");
+    document
+      .getElementById("uploadCsvBtn")
+      .addEventListener("click", () => csvFileInput.click());
+
+    csvFileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const text = event.target.result;
+        const parsed = parseCSV(text);
+
+        if (!parsed.length) {
+          alert("CSV 내용이 비어 있습니다.");
+          return;
+        }
+
+        // 가장 긴 행 기준으로 열 수 파악
+        let maxCols = 0;
+        parsed.forEach((row) => {
+          if (row.length > maxCols) maxCols = row.length;
+        });
+
+        const targetCols = Math.min(maxCols, MAX_COLUMNS);
+        ensureColumns(targetCols);
+
+        const data = parsed.map((cells) => {
+          const obj = {};
+          for (let i = 0; i < targetCols; i++) {
+            obj["col" + i] = cells[i] !== undefined ? cells[i] : "";
+          }
+          return obj;
+        });
+
+        table.setData(data);
+      };
+
+      reader.readAsText(file, "utf-8");
+      // 같은 파일 다시 선택할 수 있게 초기화
+      e.target.value = "";
+    });
+
+    // ===============================
+    // JSON 업로드
+    // (형태: [{col0: "...", col1: "..."}, ...] 예상)
+    // ===============================
+    const jsonFileInput = document.getElementById("jsonFileInput");
+    document
+      .getElementById("uploadJsonBtn")
+      .addEventListener("click", () => jsonFileInput.click());
+
+    jsonFileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const json = JSON.parse(event.target.result);
+          if (!Array.isArray(json)) {
+            alert("JSON 형식이 올바르지 않습니다. 배열 형태여야 합니다.");
+            return;
+          }
+
+          // JSON 안에서 실제 사용된 최대 컬럼 인덱스 찾기
+          let maxColIndex = -1;
+          json.forEach((row) => {
+            if (row && typeof row === "object") {
+              Object.keys(row).forEach((key) => {
+                const match = key.match(/^col(\d+)$/);
+                if (match) {
+                  const idx = parseInt(match[1], 10);
+                  if (idx > maxColIndex) maxColIndex = idx;
+                }
+              });
+            }
+          });
+
+          const targetCols = Math.min(
+            maxColIndex + 1 || INITIAL_COLUMNS,
+            MAX_COLUMNS
+          );
+          ensureColumns(targetCols);
+
+          table.setData(json);
+        } catch (err) {
+          console.error(err);
+          alert("JSON 파싱 중 오류가 발생했습니다.");
+        }
+      };
+
+      reader.readAsText(file, "utf-8");
+      e.target.value = "";
+    });
+  </script>
+</body>
+</html>
